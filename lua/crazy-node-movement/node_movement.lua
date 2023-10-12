@@ -1,15 +1,25 @@
-local api = vim.api
-local parsers = require "nvim-treesitter.parsers"
-local ts_utils = require "nvim-treesitter.ts_utils"
-local caching = require "nvim-treesitter.caching"
-local shared = require "nvim-treesitter.textobjects.shared"
+local api             = vim.api
+local parsers         = require "nvim-treesitter.parsers"
+local ts_utils        = require "nvim-treesitter.ts_utils"
+local caching         = require "nvim-treesitter.caching"
+local shared          = require "nvim-treesitter.textobjects.shared"
 local textobject_swap = require "nvim-treesitter.textobjects.swap"
-local cmd = api.nvim_command
+local augroup         = vim.api.nvim_create_augroup
+local autocmd         = vim.api.nvim_create_autocmd
+
 local M = {}
-
-local hl_namespace = api.nvim_create_namespace "crazy-node-movement"
-
 M.current_node = {}
+
+-- stylua: ignore start
+local hl_namespace = api.nvim_create_namespace "crazy-node-movement"
+local hl_group     = "CrazyNodeMovementCurrent"
+
+local au_group_name= "CrazyNodeMovement"
+
+local keyseq_MLA   = vim.api.nvim_replace_termcodes("m<", true, false, true) -- Set left '< mark
+local keyseq_MRA   = vim.api.nvim_replace_termcodes("m>", true, false, true) -- Set right '> mark
+-- stylua: ignore start
+
 local swappable_textobjects = {}
 local tick = {}
 local favorite_child = caching.create_buffer_cache()
@@ -18,6 +28,19 @@ local allow_next_parent = true
 
 function M.clear_highlights(buf)
   api.nvim_buf_clear_namespace(buf, hl_namespace, 0, -1)
+end
+
+function M.highlight_current_node(tsNode, buf, config)
+  M.clear_highlights(buf)
+  api.nvim_set_hl_ns(hl_namespace)
+  if config.highlight.group then
+    -- NOTE: This call misbehaves when :tabnew is called from vim.cmd...
+    -- api.nvim_set_hl(hl_namespace, hl_group, { link = config.highlight.group })
+      vim.cmd("highlight link " .. hl_group .. " " .. config.highlight.group)
+  else
+    api.nvim_set_hl(hl_namespace, hl_group, { fg  = config.highlight.fg })
+  end
+  ts_utils.highlight_node(tsNode, buf, hl_namespace, hl_group)
 end
 
 local function current_node_ok(buf)
@@ -37,9 +60,9 @@ function M.maybe_clear_highlights(buf)
   end
 end
 
-function M.do_node_movement(kind, swap)
+function M.do_node_movement(kind, swap, selectNode)
   local buf = vim.api.nvim_get_current_buf()
-
+  local config = require("nvim-treesitter.configs").get_module "node_movement"
   local current_node = M.current_node[buf]
 
   if not current_node_ok(buf) then
@@ -85,9 +108,36 @@ function M.do_node_movement(kind, swap)
         end
       end
     elseif kind == "left" then
-      destination_node = ts_utils.get_previous_node(current_node, allow_switch_parents, allow_next_parent)
+      if config.cycle_siblings then
+        -- If the child is the first one, then jump to the last one 
+        local parent = current_node:parent()
+        local firstChildNode = parent
+          and current_node == parent:named_child(0)
+          or false
+        if firstChildNode then
+          destination_node = parent:named_child(parent:named_child_count() - 1)
+        else
+          destination_node = ts_utils.get_previous_node(current_node, allow_switch_parents, allow_next_parent)
+        end
+      else
+        destination_node = ts_utils.get_previous_node(current_node, allow_switch_parents, allow_next_parent)
+      end
     elseif kind == "right" then
-      destination_node = ts_utils.get_next_node(current_node, allow_switch_parents, allow_next_parent)
+      if config.cycle_siblings then
+        local parent = current_node:parent()
+        local lastChildNode = parent
+          and current_node == parent:named_child(parent:named_child_count() - 1)
+          or false
+        if lastChildNode then
+          destination_node = parent:named_child(0)
+        else
+          destination_node = ts_utils.get_next_node(current_node, allow_switch_parents, allow_next_parent)
+        end
+      else 
+        destination_node = ts_utils.get_next_node(current_node, allow_switch_parents, allow_next_parent)
+      end
+    
+      -- If the child is the last one, then jump to the first one
     end
     M.current_node[buf] = destination_node or current_node
     tick[buf] = api.nvim_buf_get_changedtick(buf)
@@ -135,10 +185,39 @@ function M.do_node_movement(kind, swap)
     else
       ts_utils.goto_node(destination_node)
     end
-    M.clear_highlights(buf)
-    ts_utils.highlight_node(destination_node, buf, hl_namespace, "CrazyNodeMovementCurrent")
+
+    if selectNode then
+      M.select_current_node(destination_node, buf)
+    else
+      M.highlight_current_node(destination_node, buf, config)
+    end
   end
 end
+
+--- TODO [March 30, 2025]: description 
+M.select_up_topmost = function ()
+  local buf = vim.api.nvim_get_current_buf()
+  local config = require("nvim-treesitter.configs").get_module "node_movement"
+  local current_node = M.current_node[buf]
+  if not current_node_ok(buf) then
+    current_node = ts_utils.get_node_at_cursor()
+  end
+
+  if not (parsers.has_parser() or current_node) then
+    return
+  end
+
+  local rootNode = vim.treesitter.get_parser():trees()[1]:root()
+  local destinationNode = rootNode:child_with_descendant(current_node)
+
+  if destinationNode then
+    M.current_node[buf] = destinationNode
+    M.select_current_node(destinationNode, buf)
+  else
+    print(("%s: upmost node is not found ;)"):format(debug.getinfo(1).source))
+  end
+end
+
 
 M.move_up = function()
   M.do_node_movement "up"
@@ -163,65 +242,104 @@ M.swap_right = function()
   M.do_node_movement("right", true)
 end
 
-M.select_current_node = function()
-  local buf = vim.api.nvim_get_current_buf()
-  local current_node = M.current_node[buf]
-  if not current_node_ok(buf) then
+
+
+-- stylua: ignore start
+-- Export select_up, select_down, select_left, select_right
+local selectDirections = {
+  select_up    = "up",
+  select_down  = "down",
+  select_left  = "left",
+  select_right = "right"
+}
+for select_action, direction in pairs(selectDirections) do
+  M[select_action] = function()
+      M.do_node_movement(direction, false, true)
+  end
+end
+-- stylua: ignore end
+
+M.select_current_node = function(destination_node, buf)
+  buf = buf or vim.api.nvim_get_current_buf()
+  local current_node = destination_node or M.current_node[buf]
+  if not (destination_node or current_node_ok(buf)) then
     current_node = ts_utils.get_node_at_cursor()
+    M.current_node[buf] = current_node
   end
   if current_node then
-    ts_utils.update_selection(buf, current_node)
+    local start_row, start_col, end_row, end_col = ts_utils.get_vim_range({
+      vim.treesitter.get_node_range(current_node),
+    }, buf)
+
+    M.clear_highlights(buf)
+    -- NOTE: Ordering is important: ALWAYS put the cursor at leftmost col!
+    vim.api.nvim_win_set_cursor(0, { end_row, end_col - 1 })
+    vim.api.nvim_feedkeys(keyseq_MLA, "x", false)
+    vim.api.nvim_win_set_cursor(0, { start_row, start_col - 1 })
+    vim.api.nvim_feedkeys(keyseq_MRA, "x", false)
+    vim.cmd [[noautocmd normal! gv]]
   end
 end
 
+-- TODO: Move to plugin/crazy-node-movement.lua
 function M.attach(bufnr)
   local buf = bufnr or api.nvim_get_current_buf()
 
   local config = require("nvim-treesitter.configs").get_module "node_movement"
+  config._attachedMappings = {}
   swappable_textobjects = config.swappable_textobjects
   allow_switch_parents = config.allow_switch_parents
   allow_next_parent = config.allow_next_parent
   for funcname, mapping in pairs(config.keymaps) do
-    api.nvim_buf_set_keymap(
-      buf,
-      "n",
-      mapping,
-      string.format(":lua require'crazy-node-movement.node_movement'.%s()<CR>", funcname),
-      { silent = true }
-    )
-    if funcname == "select_current_node" then
-      api.nvim_buf_set_keymap(
-        buf,
-        "o",
-        mapping,
-        string.format(":lua require'crazy-node-movement.node_movement'.%s()<CR>", funcname),
-        { silent = true }
-      )
+    if string.match(funcname, "move") and mapping ~= "" then
+      table.insert(config._attachedMappings, mapping)
+      api.nvim_buf_set_keymap(buf, "n", mapping, "", {
+        silent = true,
+        callback = M[funcname],
+      })
+    end
+    if string.match(funcname, "select") and mapping ~= "" then
+      table.insert(config._attachedMappings, mapping)
+      api.nvim_buf_set_keymap(buf, "v", mapping, "", {
+        silent = true,
+        callback = M[funcname],
+      })
     end
   end
-  cmd(string.format("augroup CrazyNodeMovementCurrent_%d", bufnr))
-  cmd "au!"
-  -- luacheck: push ignore 631
-  cmd(
-    string.format(
-      [[autocmd CursorMoved <buffer=%d> lua require'crazy-node-movement.node_movement'.maybe_clear_highlights(%d)]],
-      bufnr,
-      bufnr
-    )
-  )
-  -- luacheck: pop
-  cmd "augroup END"
+  if config.keymaps.select_current_node and mapping ~= "" then
+    api.nvim_buf_set_keymap(buf, "o", config.keymaps.select_current_node, "", {
+      silent = true,
+      callback = M.select_current_node,
+    })
+  end
+
+  local au_group_id  = augroup(au_group_name, { clear = false })
+
+  autocmd({
+    "CursorMoved",
+  }, {
+    group = au_group_id,
+    buffer = buf,
+    callback = function(opts)
+      M.maybe_clear_highlights(opts.buf)
+    end,
+  })
+
 end
 
-function M.detach(bufnr)
-  local buf = bufnr or api.nvim_get_current_buf()
+function M.detach(buf)
+  local buf = buf or api.nvim_get_current_buf()
 
-  M.clear_highlights(bufnr)
-  vim.cmd(string.format("autocmd! CrazyNodeMovementCurrent_%d CursorMoved", bufnr))
+  M.clear_highlights(buf)
+  vim.api.nvim_del_augroup_by_name(au_group_name)
   local config = require("nvim-treesitter.configs").get_module "node_movement"
-  for _, mapping in pairs(config.keymaps) do
-    api.nvim_buf_del_keymap(buf, "n", mapping)
+  for _, mapping in ipairs(config._attachedMappings) do
+    local bufferHasMapping = vim.fn.mapcheck(mapping, "n") ~= ""
+    if bufferHasMapping then
+      api.nvim_buf_del_keymap(buf, "n", mapping)
+    end
   end
+  config._attachedMappings = nil
 end
 
 return M
